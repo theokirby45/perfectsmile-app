@@ -11,6 +11,19 @@ const APIS = [
   { label: 'Perfectsmile API (f7ec0705)', base: 'https://txp-prelive.smile2impress.com/api/f7ec0705-84c3-4594-a598-d1e7a523ad8e/v1.0', token: 'FC3B774F363DB6749D6DF65BEB012427' },
 ];
 
+function fileToBase64(file) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => {
+      // result is "data:image/jpeg;base64,XXXX" — strip the prefix
+      const base64 = reader.result.split(',')[1];
+      resolve(base64);
+    };
+    reader.onerror = reject;
+    reader.readAsDataURL(file);
+  });
+}
+
 function extractImageUrls(obj, found = []) {
   if (!obj || typeof obj !== 'object') return found;
   for (const val of Object.values(obj)) {
@@ -73,7 +86,9 @@ function JobCard({ job, token, onUpdate }) {
     return () => clearInterval(t);
   }, [job.status]);
 
-  const imageUrls = job.result ? extractImageUrls(job.result) : [];
+  const resultImage = job.result?.result_image;
+  const processingTime = job.result?.processing_time;
+  const imageUrls = job.result && !resultImage ? extractImageUrls(job.result) : [];
 
   return (
     <div style={{
@@ -107,9 +122,14 @@ function JobCard({ job, token, onUpdate }) {
           </div>
           <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
             <StatusBadge status={job.status} />
-            {(job.status === 'polling') && (
+            {job.status === 'polling' && (
               <span style={{ fontSize: 12, color: '#888' }}>
                 {elapsed(job.startTime)}
+              </span>
+            )}
+            {processingTime != null && (
+              <span style={{ fontSize: 12, color: '#888' }}>
+                {processingTime.toFixed ? processingTime.toFixed(2) : processingTime}s
               </span>
             )}
           </div>
@@ -119,6 +139,13 @@ function JobCard({ job, token, onUpdate }) {
       {/* Result */}
       {job.status === 'done' && (
         <div style={{ padding: '14px 16px' }}>
+          {resultImage && (
+            <img
+              src={`data:image/jpeg;base64,${resultImage}`}
+              alt="Result"
+              style={{ width: '100%', borderRadius: 10, display: 'block', marginBottom: 12 }}
+            />
+          )}
           {imageUrls.length > 0 && (
             <div style={{ marginBottom: 12, display: 'flex', flexWrap: 'wrap', gap: 8 }}>
               {imageUrls.map((url, i) => (
@@ -265,35 +292,52 @@ export default function Home() {
     setSubmitting(true);
 
     try {
-      const formData = new FormData();
-      formData.append('files', file);
-
-      const res = await fetch('/api/create', {
-        method: 'POST',
-        headers: { 'x-bearer-token': token, 'x-api-base': apiBase },
-        body: formData,
-      });
-
-      const data = await res.json();
-
-      if (!res.ok) {
-        updateJob(jobId, { status: 'error', error: `${res.status}: ${JSON.stringify(data)}` });
-        setSubmitting(false);
-        return;
-      }
-
-      const uid = extractUid(data);
-      if (!uid) {
-        updateJob(jobId, {
-          status: 'error',
-          error: `No UID in response: ${JSON.stringify(data)}`,
+      if (apiIndex === 1) {
+        // Perfectsmile API — synchronous, JSON body with base64 image
+        const image = await fileToBase64(file);
+        const res = await fetch('/api/perfectsmile', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', 'x-bearer-token': token },
+          body: JSON.stringify({ image }),
         });
-        setSubmitting(false);
-        return;
-      }
+        const data = await res.json();
+        if (!res.ok) {
+          updateJob(jobId, { status: 'error', error: `${res.status}: ${JSON.stringify(data)}` });
+        } else {
+          updateJob(jobId, { status: 'done', result: data });
+        }
+      } else {
+        // Jobs API — multipart upload + polling
+        const formData = new FormData();
+        formData.append('files', file);
 
-      updateJob(jobId, { status: 'polling', uid });
-      schedulePoll(jobId, uid, token, apiBase);
+        const res = await fetch('/api/create', {
+          method: 'POST',
+          headers: { 'x-bearer-token': token, 'x-api-base': apiBase },
+          body: formData,
+        });
+
+        const data = await res.json();
+
+        if (!res.ok) {
+          updateJob(jobId, { status: 'error', error: `${res.status}: ${JSON.stringify(data)}` });
+          setSubmitting(false);
+          return;
+        }
+
+        const uid = extractUid(data);
+        if (!uid) {
+          updateJob(jobId, {
+            status: 'error',
+            error: `No UID in response: ${JSON.stringify(data)}`,
+          });
+          setSubmitting(false);
+          return;
+        }
+
+        updateJob(jobId, { status: 'polling', uid });
+        schedulePoll(jobId, uid, token, apiBase);
+      }
     } catch (err) {
       updateJob(jobId, { status: 'error', error: err.message });
     }
