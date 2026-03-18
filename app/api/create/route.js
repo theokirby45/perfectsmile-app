@@ -1,10 +1,12 @@
-const API_BASE = 'https://txp-prelive.smile2impress.com/api/a065f828-8dfa-455c-a63b-c8cd82b70840/v0.0.1';
-
 export async function POST(request) {
   const token = request.headers.get('x-bearer-token') || process.env.BEARER_TOKEN;
+  const apiBase = request.headers.get('x-api-base');
 
   if (!token) {
     return Response.json({ error: 'No bearer token provided' }, { status: 401 });
+  }
+  if (!apiBase) {
+    return Response.json({ error: 'No x-api-base header provided' }, { status: 400 });
   }
 
   try {
@@ -16,7 +18,7 @@ export async function POST(request) {
       outgoingForm.append(key, value);
     }
 
-    const response = await fetch(`${API_BASE}/perfectsmile/create`, {
+    const response = await fetch(`${apiBase}/perfectsmile/create`, {
       method: 'POST',
       headers: { Authorization: `Bearer ${token}` },
       body: outgoingForm,

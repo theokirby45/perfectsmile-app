@@ -1,17 +1,23 @@
-const API_BASE =
-  'https://txp-prelive.smile2impress.com/api/a065f828-8dfa-455c-a63b-c8cd82b70840/v0.0.1/perfectsmile';
-
 export async function GET(request, { params }) {
   const { uid } = params;
-  const token =
-    request.headers.get('x-bearer-token') || process.env.BEARER_TOKEN;
+  const token = request.headers.get('x-bearer-token') || process.env.BEARER_TOKEN;
+  const apiBase = request.headers.get('x-api-base');
 
-  const response = await fetch(`${API_BASE}/get/${uid}`, {
-    headers: {
-      Authorization: `Bearer ${token}`,
-    },
-  });
+  if (!apiBase) {
+    return Response.json({ error: 'No x-api-base header provided' }, { status: 400 });
+  }
 
-  const data = await response.json();
-  return Response.json(data, { status: response.status });
+  try {
+    const response = await fetch(`${apiBase}/perfectsmile/get/${uid}`, {
+      headers: { Authorization: `Bearer ${token}` },
+    });
+
+    const text = await response.text();
+    let data;
+    try { data = JSON.parse(text); } catch { data = { raw: text }; }
+
+    return Response.json(data, { status: response.status });
+  } catch (err) {
+    return Response.json({ error: err.message }, { status: 500 });
+  }
 }
