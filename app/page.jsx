@@ -65,7 +65,7 @@ export default function Home() {
 
     try {
       const formData = new FormData();
-      formData.append('image', file);
+      formData.append('files', file);
 
       const createRes = await fetch('/api/create', {
         method: 'POST',
