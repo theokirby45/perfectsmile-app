@@ -7,8 +7,8 @@ const POLL_INTERVAL = 30_000;
 const MAX_POLLS = 20;
 
 const APIS = [
-  { label: 'Jobs API (a065f828)', base: 'https://txp-prelive.smile2impress.com/api/a065f828-8dfa-455c-a63b-c8cd82b70840/v0.0.1', token: 'D0D41351C50A41E887F33AC51FF1CF40' },
-  { label: 'Perfectsmile API (f7ec0705)', base: 'https://txp-prelive.smile2impress.com/api/f7ec0705-84c3-4594-a598-d1e7a523ad8e/v1.0', token: 'FC3B774F363DB6749D6DF65BEB012427' },
+  { label: 'Jobs API (a065f828)', base: 'https://txp-prelive.smile2impress.com/api/a065f828-8dfa-455c-a63b-c8cd82b70840/v0.0.1' },
+  { label: 'Perfectsmile API (f7ec0705)', base: 'https://txp-prelive.smile2impress.com/api/f7ec0705-84c3-4594-a598-d1e7a523ad8e/v1.0' },
 ];
 
 function fileToBase64(file) {
@@ -119,6 +119,9 @@ function JobCard({ job, token, onUpdate }) {
         <div style={{ flex: 1, minWidth: 0 }}>
           <div style={{ fontSize: 12, color: '#999', marginBottom: 4 }}>
             {new Date(job.startTime).toLocaleTimeString()}
+            {job.apiLabel && (
+              <span style={{ marginLeft: 8, color: '#bbb' }}>· {job.apiLabel}</span>
+            )}
           </div>
           <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
             <StatusBadge status={job.status} />
@@ -203,7 +206,7 @@ export default function Home() {
     const idx = savedIdx !== null ? Number(savedIdx) : 0;
     setApiIndex(idx);
     const savedToken = localStorage.getItem(`ps_bearer_token_${idx}`);
-    setToken(savedToken ?? APIS[idx].token);
+    setToken(savedToken ?? '');
     return () => {
       Object.values(pollTimers.current).forEach(clearTimeout);
     };
@@ -214,7 +217,7 @@ export default function Home() {
     setApiIndex(idx);
     localStorage.setItem('ps_api_index', idx);
     const savedToken = localStorage.getItem(`ps_bearer_token_${idx}`);
-    const t = savedToken ?? APIS[idx].token;
+    const t = savedToken ?? '';
     setToken(t);
   }
 
@@ -274,6 +277,7 @@ export default function Home() {
     const startTime = Date.now();
     const previews = preview ? [preview] : [];
     const apiBase = APIS[apiIndex].base;
+    const apiLabel = APIS[apiIndex].label;
 
     setJobs(prev => [{
       id: jobId,
@@ -283,6 +287,7 @@ export default function Home() {
       result: null,
       error: null,
       startTime,
+      apiLabel,
     }, ...prev]);
 
     // Reset form immediately
