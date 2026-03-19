@@ -3,12 +3,13 @@
 import { useState, useEffect, useRef, useCallback } from 'react';
 
 const BLUE = '#072AC8';
-const POLL_INTERVAL = 30_000;
-const MAX_POLLS = 20;
+const POLL_INTERVAL = 5000;
+const MAX_POLLS = 60;
 
 const APIS = [
-  { label: 'Jobs API (a065f828)', base: 'https://txp-prelive.smile2impress.com/api/a065f828-8dfa-455c-a63b-c8cd82b70840/v0.0.1' },
-  { label: 'Perfectsmile API (f7ec0705)', base: 'https://txp-prelive.smile2impress.com/api/f7ec0705-84c3-4594-a598-d1e7a523ad8e/v1.0' },
+  { label: 'Jobs API — Dev', base: 'https://txp-dev.smile2impress.com/api/a065f828-8dfa-455c-a63b-c8cd82b70840/v0.0.1', token: 'D0D41351C50A41E887F33AC51FF1CF40' },
+  { label: 'Jobs API — Prelive', base: 'https://txp-prelive.smile2impress.com/api/a065f828-8dfa-455c-a63b-c8cd82b70840/v0.0.1', token: 'D0D41351C50A41E887F33AC51FF1CF40' },
+  { label: 'Perfectsmile API — Prelive', base: 'https://txp-prelive.smile2impress.com/api/f7ec0705-84c3-4594-a598-d1e7a523ad8e/v1.0', token: 'FC3B774F363DB6749D6DF65BEB012427' },
 ];
 
 function fileToBase64(file) {
@@ -24,22 +25,11 @@ function fileToBase64(file) {
   });
 }
 
-function extractImageUrls(obj, found = []) {
-  if (!obj || typeof obj !== 'object') return found;
-  for (const val of Object.values(obj)) {
-    if (typeof val === 'string' && /^https?:\/\/.+\.(jpg|jpeg|png|gif|webp|svg)/i.test(val)) {
-      found.push(val);
-    } else if (typeof val === 'object') {
-      extractImageUrls(val, found);
-    }
-  }
-  return found;
-}
 
 function getJobStatus(data) {
   const s = data?.status?.toLowerCase();
   if (s === 'failed') return 'failed';
-  if (s === 'completed' || s === 'done' || s === 'success') return 'completed';
+  if (s === 'succeeded' || s === 'completed' || s === 'done' || s === 'success') return 'completed';
   return 'pending';
 }
 
@@ -86,9 +76,9 @@ function JobCard({ job, token, onUpdate }) {
     return () => clearInterval(t);
   }, [job.status]);
 
+  const outputUrl = job.result?.output_url;
   const resultImage = job.result?.result_image;
   const processingTime = job.result?.processing_time;
-  const imageUrls = job.result && !resultImage ? extractImageUrls(job.result) : [];
 
   return (
     <div style={{
@@ -142,21 +132,19 @@ function JobCard({ job, token, onUpdate }) {
       {/* Result */}
       {job.status === 'done' && (
         <div style={{ padding: '14px 16px' }}>
-          {resultImage && (
+          {outputUrl && (
             <img
-              src={`data:image/jpeg;base64,${resultImage}`}
+              src={outputUrl}
               alt="Result"
               style={{ width: '100%', borderRadius: 10, display: 'block', marginBottom: 12 }}
             />
           )}
-          {imageUrls.length > 0 && (
-            <div style={{ marginBottom: 12, display: 'flex', flexWrap: 'wrap', gap: 8 }}>
-              {imageUrls.map((url, i) => (
-                <img key={i} src={url} alt={`Result ${i + 1}`} style={{
-                  width: '100%', borderRadius: 10, display: 'block',
-                }} />
-              ))}
-            </div>
+          {resultImage && (
+            <img
+              src={`data:image/png;base64,${resultImage}`}
+              alt="Result"
+              style={{ width: '100%', borderRadius: 10, display: 'block', marginBottom: 12 }}
+            />
           )}
           <details>
             <summary style={{ cursor: 'pointer', fontSize: 13, color: BLUE, fontWeight: 600, userSelect: 'none' }}>
@@ -206,7 +194,7 @@ export default function Home() {
     const idx = savedIdx !== null ? Number(savedIdx) : 0;
     setApiIndex(idx);
     const savedToken = localStorage.getItem(`ps_bearer_token_${idx}`);
-    setToken(savedToken ?? '');
+    setToken(savedToken ?? APIS[idx]?.token ?? '');
     return () => {
       Object.values(pollTimers.current).forEach(clearTimeout);
     };
@@ -216,9 +204,9 @@ export default function Home() {
     const idx = Number(e.target.value);
     setApiIndex(idx);
     localStorage.setItem('ps_api_index', idx);
-    const savedToken = localStorage.getItem(`ps_bearer_token_${idx}`);
-    const t = savedToken ?? '';
+    const t = APIS[idx]?.token ?? '';
     setToken(t);
+    localStorage.setItem(`ps_bearer_token_${idx}`, t);
   }
 
   function handleTokenChange(e) {
@@ -253,12 +241,12 @@ export default function Home() {
           headers: { 'x-bearer-token': tokenVal, 'x-api-base': apiBase },
         });
         const data = await res.json();
-        const jobStatus = getJobStatus(data);
-        if (jobStatus === 'failed') {
-          updateJob(jobId, { status: 'error', error: data?.message ?? data?.error ?? 'Job failed.', result: data });
-          delete pollTimers.current[jobId];
-        } else if (jobStatus === 'completed') {
+        const status = data?.status?.toLowerCase();
+        if (status === 'succeeded') {
           updateJob(jobId, { status: 'done', result: data });
+          delete pollTimers.current[jobId];
+        } else if (status === 'failed') {
+          updateJob(jobId, { status: 'error', error: 'The model rejected this photo — try a different image', result: data });
           delete pollTimers.current[jobId];
         } else {
           schedulePoll(jobId, uid, tokenVal, apiBase, attempt + 1);
@@ -297,12 +285,12 @@ export default function Home() {
     setSubmitting(true);
 
     try {
-      if (apiIndex === 1) {
+      if (apiIndex === 2) {
         // Perfectsmile API — synchronous, JSON body with base64 image
         const image = await fileToBase64(file);
         const res = await fetch('/api/perfectsmile', {
           method: 'POST',
-          headers: { 'Content-Type': 'application/json', 'x-bearer-token': token },
+          headers: { 'Content-Type': 'application/json', 'x-bearer-token': token, 'x-api-base': apiBase },
           body: JSON.stringify({ image }),
         });
         const data = await res.json();
