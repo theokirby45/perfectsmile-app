@@ -285,6 +285,8 @@ export default function Home() {
   const [health, setHealth] = useState(null);
   const pollTimers = useRef({});
   const fileInputRef = useRef(null);
+  const cameraInputRef = useRef(null);
+  const pickIdRef = useRef(0);
 
   useEffect(() => {
     const savedIdx = localStorage.getItem('ps_api_index');
@@ -335,12 +337,33 @@ export default function Home() {
     localStorage.setItem(`ps_bearer_token_${apiIndex}`, e.target.value);
   }
 
-  function handleFileChange(e) {
-    // Previews not yet submitted are ours to release; once a batch is submitted
-    // its job cards own the object URLs for the rest of the session.
-    picked.forEach(p => URL.revokeObjectURL(p.url));
+  // Both the camera and the library picker feed this, and both append — that's
+  // how you build up a batch one camera shot at a time.
+  function handleAddFiles(e) {
     const files = Array.from(e.target.files || []);
-    setPicked(files.map(file => ({ file, url: URL.createObjectURL(file) })));
+    if (files.length) {
+      setPicked(prev => [
+        ...prev,
+        ...files.map(file => ({ id: `pick_${pickIdRef.current++}`, file, url: URL.createObjectURL(file) })),
+      ]);
+    }
+    // Reset so re-picking or re-shooting the same file still fires onChange.
+    e.target.value = '';
+  }
+
+  // Previews not yet submitted are ours to release; once a batch is submitted
+  // its job cards own the object URLs for the rest of the session.
+  function removePicked(id) {
+    setPicked(prev => {
+      const hit = prev.find(p => p.id === id);
+      if (hit) URL.revokeObjectURL(hit.url);
+      return prev.filter(p => p.id !== id);
+    });
+  }
+
+  function clearPicked() {
+    picked.forEach(p => URL.revokeObjectURL(p.url));
+    setPicked([]);
   }
 
   function updateJob(id, patch) {
@@ -461,6 +484,7 @@ export default function Home() {
     // Reset form immediately — the job cards now own the preview URLs.
     setPicked([]);
     if (fileInputRef.current) fileInputRef.current.value = '';
+    if (cameraInputRef.current) cameraInputRef.current.value = '';
     setSubmitting(true);
 
     for (let i = 0; i < batch.length; i++) {
@@ -594,55 +618,102 @@ export default function Home() {
               </div>
             </div>
 
-            {/* File upload */}
+            {/* Photos: camera and library are separate inputs, because an input
+                carrying `capture` is camera-only and hands back exactly one shot,
+                which rules out `multiple` on that same element. */}
             <div style={{ marginBottom: 16 }}>
-              <label style={{ display: 'block', fontSize: 12, fontWeight: 600, color: '#777', marginBottom: 6, textTransform: 'uppercase', letterSpacing: '0.5px' }}>
-                Photos
-              </label>
-              <label style={{
-                display: 'flex',
-                alignItems: 'center',
-                gap: 14,
-                border: `2px dashed ${picked.length ? BLUE : '#dde'}`,
-                borderRadius: 12,
-                padding: '14px',
-                cursor: 'pointer',
-                background: picked.length ? '#f0f4ff' : '#fafafa',
-                transition: 'all 0.2s',
-              }}>
-                {picked.length ? (
-                  <div style={{ display: 'flex', gap: 6, flexShrink: 0 }}>
-                    {picked.slice(0, 3).map((p, i) => (
-                      <img key={i} src={p.url} alt="" style={{
-                        width: 52, height: 52, objectFit: 'cover', borderRadius: 8,
-                      }} />
-                    ))}
-                    {picked.length > 3 && (
-                      <div style={{
-                        width: 52, height: 52, borderRadius: 8,
-                        background: '#e2e8ff', color: BLUE,
-                        display: 'flex', alignItems: 'center', justifyContent: 'center',
-                        fontSize: 13, fontWeight: 700,
-                      }}>+{picked.length - 3}</div>
-                    )}
-                  </div>
-                ) : (
-                  <span style={{ fontSize: 32, flexShrink: 0 }}>📸</span>
-                )}
-                <span style={{ fontSize: 14, color: picked.length ? BLUE : '#888', fontWeight: picked.length ? 600 : 400 }}>
-                  {picked.length
-                    ? `${picked.length} photo${picked.length > 1 ? 's' : ''} selected`
-                    : 'Tap to choose or take photos'}
+              <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 6 }}>
+                <span style={{ fontSize: 12, fontWeight: 600, color: '#777', textTransform: 'uppercase', letterSpacing: '0.5px' }}>
+                  Photos{picked.length ? ` · ${picked.length}` : ''}
                 </span>
-                <input
-                  ref={fileInputRef}
-                  type="file"
-                  accept="image/*"
-                  multiple
-                  onChange={handleFileChange}
-                  style={{ display: 'none' }}
-                />
-              </label>
+                {picked.length > 0 && (
+                  <button
+                    type="button"
+                    onClick={clearPicked}
+                    style={{ background: 'none', border: 'none', padding: 0, fontSize: 12, fontWeight: 600, color: '#999', cursor: 'pointer' }}
+                  >
+                    Clear
+                  </button>
+                )}
+              </div>
+
+              {picked.length > 0 && (
+                <div style={{ display: 'flex', flexWrap: 'wrap', gap: 8, marginBottom: 10 }}>
+                  {picked.map(p => (
+                    <div key={p.id} style={{ position: 'relative', flexShrink: 0 }}>
+                      <img src={p.url} alt="" style={{
+                        width: 62, height: 62, objectFit: 'cover', borderRadius: 10,
+                        border: `1.5px solid ${BLUE}`, display: 'block',
+                      }} />
+                      <button
+                        type="button"
+                        onClick={() => removePicked(p.id)}
+                        aria-label={`Remove ${p.file.name}`}
+                        style={{
+                          position: 'absolute', top: -6, right: -6,
+                          width: 22, height: 22, borderRadius: '50%',
+                          background: '#fff', color: '#c0392b',
+                          border: '1px solid #e6e6e6', boxShadow: '0 1px 4px rgba(0,0,0,0.18)',
+                          fontSize: 14, lineHeight: 1, fontWeight: 700,
+                          cursor: 'pointer', padding: 0,
+                          display: 'flex', alignItems: 'center', justifyContent: 'center',
+                        }}
+                      >
+                        ×
+                      </button>
+                    </div>
+                  ))}
+                </div>
+              )}
+
+              <div style={{ display: 'flex', gap: 8 }}>
+                <button
+                  type="button"
+                  onClick={() => cameraInputRef.current?.click()}
+                  style={{
+                    flex: 1, padding: '13px 10px',
+                    border: `2px dashed ${picked.length ? BLUE : '#dde'}`,
+                    borderRadius: 12, background: picked.length ? '#f0f4ff' : '#fafafa',
+                    color: picked.length ? BLUE : '#666',
+                    fontSize: 14, fontWeight: 600, cursor: 'pointer',
+                  }}
+                >
+                  📷 Take Photo
+                </button>
+                <button
+                  type="button"
+                  onClick={() => fileInputRef.current?.click()}
+                  style={{
+                    flex: 1, padding: '13px 10px',
+                    border: `2px dashed ${picked.length ? BLUE : '#dde'}`,
+                    borderRadius: 12, background: picked.length ? '#f0f4ff' : '#fafafa',
+                    color: picked.length ? BLUE : '#666',
+                    fontSize: 14, fontWeight: 600, cursor: 'pointer',
+                  }}
+                >
+                  🖼 Choose Photos
+                </button>
+              </div>
+              <div style={{ fontSize: 11, color: '#aaa', marginTop: 6 }}>
+                Add as many as you like — they submit together.
+              </div>
+
+              <input
+                ref={cameraInputRef}
+                type="file"
+                accept="image/*"
+                capture="environment"
+                onChange={handleAddFiles}
+                style={{ display: 'none' }}
+              />
+              <input
+                ref={fileInputRef}
+                type="file"
+                accept="image/*"
+                multiple
+                onChange={handleAddFiles}
+                style={{ display: 'none' }}
+              />
             </div>
 
             <button
