@@ -1,6 +1,9 @@
 'use client';
 
-import { useState, useEffect, useRef, useCallback } from 'react';
+import { useState, useEffect, useRef, useCallback, useId } from 'react';
+import { createTreatment } from './gl/treatment';
+import { detectFace, createPainter, warmUp } from './gl/landmarks';
+import { celebrate, chime, beat, unlockAudio, setSoundEnabled } from './fx/celebrate';
 
 const BLUE = '#072AC8';
 const POLL_INTERVAL = 5000;
@@ -74,10 +77,39 @@ function StatusBadge({ status }) {
 // at the handle position; a transparent range input over the whole frame drives
 // it, which gets us touch-drag and keyboard support from the native control.
 function BeforeAfterSlider({ before, after }) {
-  const [pos, setPos] = useState(50);
+  const [pos, setPos] = useState(0);
+  const userMoved = useRef(false);
+  const frameRef = useRef(null);
+
+  // The payoff moment — this component mounts exactly once per result.
+  useEffect(() => {
+    frameRef.current?.scrollIntoView({ block: 'center' });
+    celebrate(frameRef.current);
+    chime();
+  }, []);
+
+  // Reveal: wipe from the result across to the halfway mark. Bails the moment
+  // the user grabs the handle so it never fights a drag.
+  useEffect(() => {
+    if (window.matchMedia?.('(prefers-reduced-motion: reduce)').matches) {
+      setPos(50);
+      return;
+    }
+    const DUR = 900;
+    const t0 = performance.now();
+    let raf;
+    const tick = now => {
+      if (userMoved.current) return;
+      const p = Math.min(1, (now - t0) / DUR);
+      setPos((1 - Math.pow(1 - p, 3)) * 50);
+      if (p < 1) raf = requestAnimationFrame(tick);
+    };
+    raf = requestAnimationFrame(tick);
+    return () => cancelAnimationFrame(raf);
+  }, []);
 
   return (
-    <div style={{
+    <div ref={frameRef} style={{
       position: 'relative',
       width: '100%',
       borderRadius: 10,
@@ -99,6 +131,11 @@ function BeforeAfterSlider({ before, after }) {
           clipPath: `inset(0 0 0 ${pos}%)`,
         }}
       />
+
+      <div className="ps-fx" style={{
+        position: 'absolute', inset: 0, background: '#fff',
+        pointerEvents: 'none', animation: 'ps-flash 0.7s ease-out both',
+      }} />
 
       <span style={{
         position: 'absolute', top: 8, left: 8,
@@ -140,7 +177,7 @@ function BeforeAfterSlider({ before, after }) {
         min="0"
         max="100"
         value={pos}
-        onChange={e => setPos(Number(e.target.value))}
+        onChange={e => { userMoved.current = true; setPos(Number(e.target.value)); }}
         aria-label="Before / after comparison"
         style={{
           position: 'absolute', inset: 0,
@@ -153,10 +190,315 @@ function BeforeAfterSlider({ before, after }) {
   );
 }
 
+// Staged "treatment" theatre played over the customer's own photo while the API
+// works. Timings are open-loop — the API reports no progress — so the last stage
+// holds indefinitely and the reveal is whatever actually comes back.
+const STAGES = [
+  { key: 'scan',   label: 'Scanning your smile',      sub: 'capturing facial geometry',  ms: 2600 },
+  { key: 'map',    label: 'Mapping your face',        sub: 'detecting 478 landmarks',    ms: 2600 },
+  { key: 'lock',   label: 'Locking onto your smile',  sub: 'isolating the lip contour',   ms: 2800 },
+  { key: 'whiten', label: 'Polishing & whitening',    sub: 'applying enamel shading',    ms: Infinity },
+];
+
+function TreatmentSequence({ src, active, afterSrc, onRevealDone, fullscreen }) {
+  const gridId = useId().replace(/:/g, '');
+  const [stage, setStage] = useState(0);
+  const [gpu, setGpu] = useState(false);
+  const canvasRef = useRef(null);
+  const glRef = useRef(null);
+  const doneRef = useRef(onRevealDone);
+  doneRef.current = onRevealDone;
+  const [face, setFace] = useState(null);
+  const meshRef = useRef(null);
+  const stageRef = useRef(0);
+  stageRef.current = stage;
+  const [tickNow, setTickNow] = useState(() => Date.now());
+  const stageStart = useRef(Date.now());
+
+  useEffect(() => { stageStart.current = Date.now(); }, [stage]);
+
+  useEffect(() => {
+    if (!active) return;
+    const id = setInterval(() => setTickNow(Date.now()), 70);
+    return () => clearInterval(id);
+  }, [active]);
+
+  useEffect(() => { if (active) beat(stage); }, [stage, active]);
+
+  // Detect once per photo. Null result (no model, no face) just leaves the
+  // shader on its default anchor — the sequence still runs.
+  useEffect(() => {
+    let cancelled = false;
+    const img = new Image();
+    img.onload = async () => {
+      const res = await detectFace(img);
+      if (cancelled || !res) return;
+      setFace({ ...res, aspect: img.naturalWidth / Math.max(1, img.naturalHeight) });
+    };
+    img.onerror = () => {};
+    img.src = src;
+    return () => { cancelled = true; };
+  }, [src]);
+
+  // Point every GPU effect at the real mouth. Re-runs when GL comes up, since
+  // detection and context creation race.
+  useEffect(() => {
+    if (face) glRef.current?.setMouth(face.mouth.x, face.mouth.y);
+  }, [face, gpu]);
+
+  // Progressive mesh reveal, painted by MediaPipe's DrawingUtils.
+  useEffect(() => {
+    if (!face || !meshRef.current) return;
+    let cancelled = false;
+    let raf = 0;
+    (async () => {
+      const cv = meshRef.current;
+      if (!cv) return;
+      const ctx = cv.getContext('2d');
+      const paint = await createPainter(ctx);
+      if (cancelled) return;
+      const t0 = performance.now();
+      const tick = now => {
+        if (cancelled || !meshRef.current) return;
+        // Landmarks are normalised to the photo, so size this canvas to the
+        // cover rect — otherwise the mesh stretches once the frame is the
+        // viewport rather than the image.
+        const host = cv.parentElement;
+        const fw = host?.clientWidth || 0;
+        const fh = host?.clientHeight || 0;
+        if (!fw || !fh) { raf = requestAnimationFrame(tick); return; }
+        const ia = face.aspect || 1;
+        const fa = fw / fh;
+        const dw = fa > ia ? fw : fh * ia;
+        const dh = fa > ia ? fw / ia : fh;
+        cv.style.left = `${(fw - dw) / 2}px`;
+        cv.style.top = `${(fh - dh) / 2}px`;
+        cv.style.width = `${dw}px`;
+        cv.style.height = `${dh}px`;
+        const dpr = Math.min(window.devicePixelRatio || 1, 2);
+        const w = Math.max(1, Math.round(dw * dpr));
+        const h = Math.max(1, Math.round(dh * dpr));
+        if (cv.width !== w || cv.height !== h) { cv.width = w; cv.height = h; }
+        ctx.clearRect(0, 0, cv.width, cv.height);
+        if (stageRef.current >= 1) {
+          paint(face.landmarks, {
+            progress: Math.min(1, (now - t0) / 1100),
+            lips: stageRef.current >= 2,
+          });
+        }
+        raf = requestAnimationFrame(tick);
+      };
+      raf = requestAnimationFrame(tick);
+    })();
+    return () => { cancelled = true; cancelAnimationFrame(raf); };
+  }, [face]);
+
+  // WebGL2 does the pixel-level work (ripple, aberration, bloom, dissolve);
+  // the detected face mesh and the caption layer sit on top of it.
+  // Any failure here leaves `gpu` false and the CSS sequence showing.
+  useEffect(() => {
+    if (!canvasRef.current) return;
+    if (window.matchMedia?.('(prefers-reduced-motion: reduce)').matches) return;
+    let inst = null;
+    try {
+      inst = createTreatment(canvasRef.current, src);
+    } catch (err) {
+      console.warn('[treatment] falling back to CSS:', err);
+    }
+    if (!inst) return;
+    glRef.current = inst;
+    setGpu(true);
+    return () => {
+      inst.dispose();
+      glRef.current = null;
+      setGpu(false);
+    };
+  }, [src]);
+
+  useEffect(() => { glRef.current?.setStage(stage); }, [stage, gpu]);
+
+  useEffect(() => {
+    if (!active) return;
+    if (stage >= STAGES.length - 1) return;
+    const t = setTimeout(() => {
+      setStage(s => s + 1);
+      try { navigator.vibrate?.(12); } catch {}
+    }, STAGES[stage].ms);
+    return () => clearTimeout(t);
+  }, [stage, active]);
+
+  // The result landed: dissolve to it on the GPU, then hand over to the slider.
+  // Every failure path calls back immediately so the slider is never blocked.
+  useEffect(() => {
+    if (!afterSrc) return;
+    const inst = glRef.current;
+    if (!inst) { doneRef.current?.(); return; }
+    let cancelled = false;
+    (async () => {
+      const ok = await inst.setAfter(afterSrc);
+      if (cancelled) return;
+      if (!ok) { doneRef.current?.(); return; }
+      inst.punch?.();
+      const DUR = 1200;
+      const t0 = performance.now();
+      const tick = now => {
+        if (cancelled) return;
+        const p = Math.min(1, (now - t0) / DUR);
+        inst.setReveal(p);
+        if (p < 1) requestAnimationFrame(tick);
+        else doneRef.current?.();
+      };
+      requestAnimationFrame(tick);
+    })();
+    return () => { cancelled = true; };
+  }, [afterSrc]);
+
+  const s = STAGES[stage];
+  const at = stage;
+
+  const stageMs = STAGES[stage].ms === Infinity ? 4000 : STAGES[stage].ms;
+  const inStage = Math.min(1, Math.max(0, (tickNow - stageStart.current) / stageMs));
+  const held = ((tickNow - stageStart.current) / 1000).toFixed(1);
+  const readout =
+    at === 0 ? `SCAN ${Math.round(inStage * 100)}%`
+    : at === 1 ? (face ? `LANDMARKS ${Math.round(inStage * 478)} / 478` : 'DETECTING FACE…')
+    : at === 2 ? (face ? 'LIP CONTOUR · 40 POINTS LOCKED' : 'NO FACE FOUND · USING CENTRE')
+    : `ENAMEL PASS · ${held}s`;
+
+  return (
+    <div className="ps-fx" style={{
+      position: 'relative', width: '100%',
+      height: fullscreen ? '100%' : undefined,
+      borderRadius: fullscreen ? 0 : 10,
+      overflow: 'hidden', background: '#000', lineHeight: 0,
+      // Only shake full-screen: inline, the translate would flash card-coloured
+      // slivers at the edges.
+      animation: fullscreen
+        ? `${stage % 2 ? 'ps-shakeA' : 'ps-shakeB'} 0.5s cubic-bezier(.36,.07,.19,.97)`
+        : undefined,
+    }}>
+      <img src={src} alt="Your photo" style={fullscreen ? {
+        width: '100%', height: '100%', objectFit: 'cover', display: 'block',
+      } : {
+        width: '100%', height: 'auto', display: 'block',
+        filter: !gpu && at >= 3 ? 'brightness(1.06) contrast(1.04) saturate(1.05)' : 'none',
+        transition: 'filter 1.2s ease',
+      }} />
+      <canvas ref={canvasRef} style={{
+        position: 'absolute', inset: 0, width: '100%', height: '100%',
+        display: 'block', opacity: gpu ? 1 : 0,
+      }} />
+
+      {/* Cool technical tint + vignette */}
+      {!gpu && <div style={{
+        position: 'absolute', inset: 0, pointerEvents: 'none',
+        background: 'radial-gradient(circle at 50% 45%, rgba(7,42,200,0.05), rgba(2,6,40,0.5))',
+        mixBlendMode: 'multiply',
+      }} />}
+
+      {!gpu && (<>
+      {/* Stage 0+: scan grid */}
+      <svg viewBox="0 0 100 100" preserveAspectRatio="none" style={{
+        position: 'absolute', inset: 0, width: '100%', height: '100%',
+        pointerEvents: 'none', opacity: 0.35,
+      }}>
+        <defs>
+          <pattern id={`grid${gridId}`} width="8" height="8" patternUnits="userSpaceOnUse">
+            <path d="M8 0H0V8" fill="none" stroke="#5ce1ff" strokeWidth="0.25" />
+          </pattern>
+        </defs>
+        <rect width="100" height="100" fill={`url(#grid${gridId})`} />
+      </svg>
+
+      {/* Stage 0+: laser sweep */}
+      <div style={{
+        position: 'absolute', top: 0, left: 0, right: 0, height: '18%',
+        pointerEvents: 'none', mixBlendMode: 'screen',
+        background: 'linear-gradient(to bottom, rgba(92,225,255,0) 0%, rgba(92,225,255,0.45) 45%, #b8f4ff 50%, rgba(92,225,255,0.45) 55%, rgba(92,225,255,0) 100%)',
+        animation: 'ps-sweep 2.2s linear infinite',
+      }} />
+      </>)}
+
+      {/* MediaPipe's own tesselation + lip contour, drawn by its DrawingUtils.
+          Nothing here is hand-authored — it's the detected mesh. */}
+      <canvas ref={meshRef} style={{
+        position: 'absolute', display: 'block', pointerEvents: 'none',
+        opacity: at >= 1 && face ? 1 : 0, transition: 'opacity 0.4s',
+      }} />
+
+      {/* Which renderer actually engaged — the fallback is otherwise silent. */}
+      <span style={{
+        position: 'absolute', top: 8, right: 8,
+        fontFamily: 'ui-monospace, SFMono-Regular, Menlo, monospace',
+        fontSize: 9, letterSpacing: '0.1em', padding: '2px 7px', borderRadius: 20,
+        background: gpu ? 'rgba(92,225,255,0.18)' : 'rgba(255,255,255,0.14)',
+        color: gpu ? '#8ceaff' : 'rgba(255,255,255,0.7)',
+        pointerEvents: 'none', lineHeight: 1.7,
+      }}>{gpu ? 'GPU' : 'CSS'}</span>
+
+      {/* Caption + indeterminate progress */}
+      <div style={{
+        position: 'absolute', left: 0, right: 0, bottom: 0,
+        padding: fullscreen ? '60px 22px calc(22px + env(safe-area-inset-bottom))' : '22px 14px 12px',
+        pointerEvents: 'none',
+        background: 'linear-gradient(to top, rgba(2,6,40,0.85), rgba(2,6,40,0))',
+      }}>
+        <div style={{ display: 'flex', alignItems: 'baseline', gap: 8, marginBottom: 3 }}>
+          <span style={{ color: '#fff', fontSize: fullscreen ? 22 : 14, fontWeight: 700, lineHeight: 1.25 }}>{s.label}</span>
+          <span style={{ color: '#5ce1ff', fontSize: 11, fontWeight: 700, lineHeight: 1.3 }}>
+            {at + 1}/{STAGES.length}
+          </span>
+        </div>
+        <div style={{
+          color: '#5ce1ff', fontSize: fullscreen ? 13 : 11, lineHeight: 1.4, marginBottom: 8,
+          fontFamily: 'ui-monospace, SFMono-Regular, Menlo, monospace',
+          fontVariantNumeric: 'tabular-nums', letterSpacing: '0.06em',
+        }}>
+          {readout}
+        </div>
+        <div style={{ display: 'flex', gap: 4 }}>
+          {STAGES.map((st, i) => (
+            <div key={st.key} style={{
+              flex: 1, height: 3, borderRadius: 2, overflow: 'hidden',
+              background: i <= at ? '#5ce1ff' : 'rgba(255,255,255,0.22)',
+              position: 'relative',
+            }}>
+              {i === at && (
+                <div style={{
+                  position: 'absolute', top: 0, bottom: 0, width: '40%',
+                  background: 'linear-gradient(90deg, transparent, #fff, transparent)',
+                  animation: 'ps-shimmer 1.1s linear infinite',
+                }} />
+              )}
+            </div>
+          ))}
+        </div>
+      </div>
+    </div>
+  );
+}
+
 function JobCard({ job }) {
   const [, setNow] = useState(Date.now());
+  const [revealDone, setRevealDone] = useState(false);
+  const [expanded, setExpanded] = useState(true);
+  const handleRevealDone = useCallback(() => setRevealDone(true), []);
 
-  const inFlight = job.status === 'polling' || job.status === 'uploading' || job.status === 'queued';
+  const queued = job.status === 'queued';
+  const active = job.status === 'polling' || job.status === 'uploading';
+  const inFlight = active || queued;
+  const afterSrcEarly = job.result?.output_url
+    || (job.result?.result_image ? `data:image/png;base64,${job.result.result_image}` : null);
+  const showSequence = !!job.preview
+    && (active || (job.status === 'done' && afterSrcEarly && !revealDone));
+
+  // Don't let the page scroll behind the takeover.
+  useEffect(() => {
+    if (!showSequence || !expanded) return;
+    const prev = document.body.style.overflow;
+    document.body.style.overflow = 'hidden';
+    return () => { document.body.style.overflow = prev; };
+  }, [showSequence, expanded]);
 
   useEffect(() => {
     if (!inFlight) return;
@@ -224,8 +566,58 @@ function JobCard({ job }) {
         </div>
       </div>
 
+      {/* Waiting its turn — a still frame. Deliberately not the live sequence:
+          each one holds a WebGL context, and a big batch would exhaust them. */}
+      {queued && job.preview && (
+        <div style={{ padding: '14px 16px' }}>
+          <div style={{ position: 'relative', borderRadius: 10, overflow: 'hidden', lineHeight: 0 }}>
+            <img src={job.preview} alt="" style={{ width: '100%', display: 'block', filter: 'brightness(0.5) saturate(0.7)' }} />
+            <span style={{
+              position: 'absolute', left: '50%', top: '50%', transform: 'translate(-50%, -50%)',
+              fontFamily: 'ui-monospace, SFMono-Regular, Menlo, monospace',
+              fontSize: 11, letterSpacing: '0.12em', textTransform: 'uppercase',
+              color: 'rgba(255,255,255,0.85)',
+            }}>In queue</span>
+          </div>
+        </div>
+      )}
+
+      {/* The main event: the customer's own photo, front and centre. Stays
+          mounted through the result so the GPU can dissolve into it. */}
+      {showSequence && (
+        // Same element position in both modes, so toggling never remounts the
+        // sequence — a remount would drop the GL context and restart detection.
+        <div style={expanded ? {
+          position: 'fixed', inset: 0, zIndex: 60, background: '#000',
+        } : { padding: '14px 16px' }}>
+          <TreatmentSequence
+            src={job.preview}
+            active={active}
+            afterSrc={job.status === 'done' ? afterSrc : null}
+            onRevealDone={handleRevealDone}
+            fullscreen={expanded}
+          />
+          {expanded && (
+            <button
+              type="button"
+              onClick={() => setExpanded(false)}
+              aria-label="Exit full screen"
+              style={{
+                position: 'absolute',
+                top: 'calc(14px + env(safe-area-inset-top))', right: 14,
+                width: 38, height: 38, borderRadius: '50%',
+                background: 'rgba(0,0,0,0.45)', color: '#fff',
+                border: '1px solid rgba(255,255,255,0.25)',
+                fontSize: 15, lineHeight: 1, cursor: 'pointer', zIndex: 2,
+                display: 'flex', alignItems: 'center', justifyContent: 'center',
+              }}
+            >✕</button>
+          )}
+        </div>
+      )}
+
       {/* Result */}
-      {job.status === 'done' && (
+      {job.status === 'done' && (revealDone || !afterSrc) && (
         <div style={{ padding: '14px 16px' }}>
           {afterSrc && job.preview && (
             <div style={{ marginBottom: 12 }}>
@@ -283,6 +675,7 @@ export default function Home() {
   const [progress, setProgress] = useState(null);
   const [jobs, setJobs] = useState([]);
   const [health, setHealth] = useState(null);
+  const [sound, setSound] = useState(true);
   const pollTimers = useRef({});
   const fileInputRef = useRef(null);
   const cameraInputRef = useRef(null);
@@ -294,6 +687,10 @@ export default function Home() {
     setApiIndex(idx);
     const savedToken = localStorage.getItem(`ps_bearer_token_${idx}`);
     setToken(savedToken ?? APIS[idx]?.token ?? '');
+    const savedSound = localStorage.getItem('ps_sound');
+    const on = savedSound === null ? true : savedSound === '1';
+    setSound(on);
+    setSoundEnabled(on);
     return () => {
       Object.values(pollTimers.current).forEach(clearTimeout);
     };
@@ -323,6 +720,15 @@ export default function Home() {
     return () => { cancelled = true; };
   }, [apiIndex]);
 
+  function toggleSound() {
+    const next = !sound;
+    setSound(next);
+    setSoundEnabled(next);
+    localStorage.setItem('ps_sound', next ? '1' : '0');
+    // Toggling is itself a gesture, so this is a valid moment to start audio.
+    if (next) unlockAudio();
+  }
+
   function handleApiChange(e) {
     const idx = Number(e.target.value);
     setApiIndex(idx);
@@ -342,6 +748,7 @@ export default function Home() {
   function handleAddFiles(e) {
     const files = Array.from(e.target.files || []);
     if (files.length) {
+      warmUp();
       setPicked(prev => [
         ...prev,
         ...files.map(file => ({ id: `pick_${pickIdRef.current++}`, file, url: URL.createObjectURL(file) })),
@@ -457,6 +864,8 @@ export default function Home() {
     e.preventDefault();
     if (!picked.length || submitting) return;
 
+    unlockAudio();
+
     const api = APIS[apiIndex];
     const stamp = Date.now();
     const batch = picked.map((p, i) => ({
@@ -511,6 +920,22 @@ export default function Home() {
         .ba-range { -webkit-appearance: none; appearance: none; background: transparent; }
         .ba-range::-webkit-slider-thumb { -webkit-appearance: none; width: 1px; height: 100%; background: transparent; }
         .ba-range::-moz-range-thumb { width: 1px; height: 100%; border: none; background: transparent; }
+
+        @keyframes ps-sweep   { 0% { transform: translateY(-100%); } 100% { transform: translateY(560%); } }
+        @keyframes ps-ring    { 0% { transform: scale(0.75); opacity: 0.9; } 100% { transform: scale(1.5); opacity: 0; } }
+        @keyframes ps-pop     { 0% { transform: scale(0); opacity: 0; } 60% { transform: scale(1.35); opacity: 1; } 100% { transform: scale(1); opacity: 0.95; } }
+        @keyframes ps-drop    { 0% { transform: translateY(-55%) scale(0.9); opacity: 0; } 70% { transform: translateY(4%) scale(1.02); opacity: 1; } 85% { transform: translateY(-2%) scale(0.99); } 100% { transform: translateY(0) scale(1); opacity: 1; } }
+        @keyframes ps-twinkle { 0%, 100% { transform: scale(0) rotate(0deg); opacity: 0; } 50% { transform: scale(1) rotate(90deg); opacity: 1; } }
+        @keyframes ps-bracket { 0% { transform: scale(1.6); opacity: 0; } 100% { transform: scale(1); opacity: 1; } }
+        @keyframes ps-shimmer { 0% { transform: translateX(-100%); } 100% { transform: translateX(300%); } }
+        @keyframes ps-flash   { 0% { opacity: 0; } 15% { opacity: 0.85; } 100% { opacity: 0; } }
+        @keyframes ps-shakeA { 0%,100% { transform: translate(0,0) } 15% { transform: translate(-5px,3px) } 35% { transform: translate(4px,-3px) } 55% { transform: translate(-3px,-2px) } 78% { transform: translate(2px,2px) } }
+        @keyframes ps-shakeB { 0%,100% { transform: translate(0,0) } 15% { transform: translate(5px,-3px) } 35% { transform: translate(-4px,3px) } 55% { transform: translate(3px,2px) } 78% { transform: translate(-2px,-2px) } }
+        @keyframes ps-glow    { 0%, 100% { opacity: 0.25; } 50% { opacity: 0.6; } }
+
+        @media (prefers-reduced-motion: reduce) {
+          .ps-fx, .ps-fx * { animation: none !important; transition: none !important; }
+        }
       `}</style>
 
       {/* Header */}
@@ -527,6 +952,20 @@ export default function Home() {
         <h1 style={{ margin: 0, fontSize: 20, fontWeight: 700, letterSpacing: '-0.3px' }}>
           Perfect Smile
         </h1>
+        <button
+          type="button"
+          onClick={toggleSound}
+          aria-pressed={sound}
+          aria-label={sound ? 'Mute reveal sound' : 'Unmute reveal sound'}
+          title={sound ? 'Sound on' : 'Sound off'}
+          style={{
+            position: 'absolute', right: 14, top: '50%', transform: 'translateY(-50%)',
+            background: 'rgba(255,255,255,0.15)', border: 'none', borderRadius: 8,
+            color: '#fff', fontSize: 15, lineHeight: 1, padding: '7px 9px', cursor: 'pointer',
+          }}
+        >
+          {sound ? '🔊' : '🔇'}
+        </button>
       </div>
 
       <div style={{ maxWidth: 480, margin: '0 auto', padding: '16px' }}>
